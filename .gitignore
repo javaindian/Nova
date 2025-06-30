@@ -1,0 +1,105 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller
+#  Usually these files are created by PyInstaller in a separate output folder.
+#  Still, it's good to list them if you run PyInstaller in the project root.
+*.spec
+dist/
+build/
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak
+venv.bak
+
+# IDE / Editor specific files
+.idea/
+.vscode/
+*.sublime-project
+*.sublime-workspace
+nbproject/
+*.DS_Store
+.project
+.pydevproject
+.settings/
+*.nbinfo
+
+# SQLite databases (if used temporarily)
+*.sqlite3
+*.db
+
+# Log files
+*.log
+logs/
+
+# Coverage reports
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints
+
+# Temporary files
+*.tmp
+*.bak
+*.swp
+*~
+
+# Secrets, sensitive data
+secrets.yaml
+secrets.json
+*.pem
+*.key
+
+# User-specific files
+*.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# Operating System files
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Optional: If you generate data files you don't want to commit
+# data/
+# output/
+# *.csv
+# *.json # Be careful if some json files are config and should be versioned
+# *.html # If reports are generated
+# *.png
+# *.jpg
