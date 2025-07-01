@@ -3,9 +3,9 @@ pandas
 plotly
 mysql-connector-python
 python-dotenv
+fyers-apiv3 # For Fyers API V3 integration
 # numpy # Usually a dependency of pandas, but can be listed explicitly
 # pandas-ta # Will be needed for strategy implementation
-# fyers-apiv3 # Or the specific Fyers API library, e.g. fyers-api
 
 # For AI/ML features later (can be commented out initially):
 # scikit-learn
