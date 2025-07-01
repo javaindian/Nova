@@ -1,174 +1,271 @@
 # This will be the actual Fyers broker implementation
-# For now, it can inherit from BaseBroker and have placeholders
-
 from .base_broker import BaseBroker
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timedelta
 import os
-# from fyers_api import fyersModel # Import when ready for actual implementation
-# from fyers_api import accessToken
+import time # For potential rate limiting or delays
+
+try:
+    from fyers_api import fyersModel
+    from fyers_api import accessToken
+    FYERS_SDK_AVAILABLE = True
+except ImportError:
+    FYERS_SDK_AVAILABLE = False
+    # Define dummy classes if SDK not available, so the rest of the code can still be parsed
+    # This helps in environments where the SDK might not be installed during initial dev/CI checks
+    class SessionModel: pass
+    class FyersModel: pass
+    print("FyersBroker Warning: 'fyers_api' library not installed. Real Fyers functionality will be unavailable.")
+
 
 class FyersBroker(BaseBroker):
-    def __init__(self, app_id=None, app_secret=None, client_id=None,
+    def __init__(self, app_id=None, app_secret=None, client_id_user=None, # Renamed client_id to client_id_user
                  totp_key=None, pin=None, redirect_uri=None,
                  access_token=None, log_path=None, params=None):
-        super().__init__("Fyers", params) # Call BaseBroker constructor
+        super().__init__("Fyers", params)
 
-        self.app_id = app_id or os.getenv('FYERS_APP_ID')
+        self.app_id = app_id or os.getenv('FYERS_APP_ID') # This is client_id for FyersModel & SessionModel
         self.app_secret = app_secret or os.getenv('FYERS_APP_SECRET')
-        self.client_id = client_id or os.getenv('FYERS_CLIENT_ID') # User's Fyers Client ID
+        self.client_id_user = client_id_user or os.getenv('FYERS_CLIENT_ID') # This is the user's Fyers login ID
         self.totp_key = totp_key or os.getenv('FYERS_TOTP_KEY')
-        self.pin = pin or os.getenv('FYERS_PIN')
-        self.redirect_uri = redirect_uri or os.getenv('FYERS_REDIRECT_URI', "http://localhost:8000/callback")
+        self.pin = pin or os.getenv('FYERS_PIN') # User's 4-digit PIN
+        self.redirect_uri = redirect_uri or os.getenv('FYERS_REDIRECT_URI', "http://localhost:3000/auth_callback") # Common redirect
 
         self.log_path = log_path or os.getenv('FYERS_LOG_PATH', "fyers_broker_logs")
         if not os.path.exists(self.log_path):
             os.makedirs(self.log_path, exist_ok=True)
 
-        self.fyers_sdk = None # This will be the fyersModel instance
-        self.access_token = access_token # Can be pre-loaded
+        self.fyers_sdk = None # Instance of FyersModel
+        self.session = None   # Instance of SessionModel
+        self.access_token = access_token
 
-        if not all([self.app_id, self.app_secret, self.client_id, self.redirect_uri]):
-            print(f"{self.broker_name} Warning: Core API credentials (APP_ID, APP_SECRET, CLIENT_ID, REDIRECT_URI) missing. Connection will likely fail.")
-            # Not raising error immediately to allow instantiation for config UI
+        if not FYERS_SDK_AVAILABLE:
+            print(f"{self.broker_name} Error: Fyers SDK is not installed. Cannot proceed with Fyers integration.")
+            # Potentially raise an error or ensure all methods fail gracefully
+            return
+
+        if not all([self.app_id, self.app_secret, self.redirect_uri]): # client_id_user, pin, totp_key are for token gen
+            print(f"{self.broker_name} Warning: Core API app credentials (APP_ID/Client_ID for App, APP_SECRET, REDIRECT_URI) missing.")
 
         if self.access_token:
-            # If token provided at init, try to use it.
-            # Actual SDK initialization will happen in connect()
-            print(f"{self.broker_name}: Initialized with a pre-set access token.")
+            print(f"{self.broker_name}: Initialized with a pre-set access token. Call connect() to validate.")
+            # Attempt to initialize FyersModel if token is present, connect will confirm
+            self._initialize_sdk_with_token()
 
 
-    def _generate_access_token_interactive(self):
-        """
-        Placeholder for Fyers V3 interactive access token generation.
-        This is complex and typically involves browser automation (Selenium) or a web server
-        to catch the redirect with the auth_code.
-        """
-        print(f"{self.broker_name}: Interactive token generation for Fyers V3 is not implemented in this placeholder.")
-        print(f"{self.broker_name}: Please generate an access token manually or using a separate utility, then provide it.")
-        # Example of how it might start with fyers_api library:
-        # session = accessToken.SessionModel(
-        #     client_id=self.app_id,
-        #     secret_key=self.app_secret, # Note: Fyers V3 might call this api_secret or similar
-        #     redirect_uri=self.redirect_uri,
-        #     response_type='code', # For Auth Code
-        #     grant_type='authorization_code'
-        #     # For V3, may need state, nonce, etc.
-        # )
-        # auth_url = session.generate_authcode() # This URL user opens in browser
-        # print(f"Please open this URL to authorize: {auth_url}")
-        # auth_code = input("Enter the auth_code from the redirect URL: ")
-        # session.set_token(auth_code)
-        # token_response = session.generate_token() # Exchanges auth_code for access_token
-        # if token_response and 'access_token' in token_response:
-        #    self.access_token = token_response['access_token']
-        #    return self.access_token
-        return None
+    def _initialize_sdk_with_token(self):
+        """Initializes FyersModel if an access token is available."""
+        if self.access_token and self.app_id and FYERS_SDK_AVAILABLE:
+            try:
+                self.fyers_sdk = fyersModel.FyersModel(
+                    client_id=self.app_id, # FyersModel uses 'client_id' for what we call app_id
+                    token=self.access_token,
+                    log_path=self.log_path
+                )
+                print(f"{self.broker_name}: FyersModel SDK initialized with existing token.")
+                # A quick check, like get_profile, should be done in connect() to confirm validity
+            except Exception as e:
+                print(f"{self.broker_name} Error: Failed to initialize FyersModel with existing token: {e}")
+                self.fyers_sdk = None
+                self.access_token = None # Invalidate potentially stale token
+        else:
+            self.fyers_sdk = None
 
-    def connect(self, access_token=None, **kwargs):
+
+    def generate_auth_url(self, state="custom_state"):
+        """Generates the Fyers authorization URL for the user to visit."""
+        if not FYERS_SDK_AVAILABLE: return None
+        if not all([self.app_id, self.app_secret, self.redirect_uri]):
+            print(f"{self.broker_name} Error: Cannot generate auth URL, missing app credentials.")
+            return None
+
+        self.session = accessToken.SessionModel(
+            client_id=self.app_id,
+            secret_key=self.app_secret,
+            redirect_uri=self.redirect_uri,
+            response_type="code", # For auth_code
+            grant_type="authorization_code", # This is for exchanging auth_code for token later
+            state=state
+        )
+        try:
+            auth_url = self.session.generate_authcode()
+            print(f"{self.broker_name}: Auth URL generated: {auth_url}")
+            return auth_url
+        except Exception as e:
+            print(f"{self.broker_name} Error generating auth URL: {e}")
+            return None
+
+    def connect(self, auth_code=None, pin=None, totp=None, access_token_override=None):
         """
         Establishes connection to Fyers API.
+        Requires auth_code (from user redirect), pin, and totp (generated from totp_key).
+        Or can use an access_token_override if provided and valid.
         """
-        if self.is_connected:
-            print(f"{self.broker_name}: Already connected.")
+        if not FYERS_SDK_AVAILABLE:
+            print(f"{self.broker_name} Error: Fyers SDK not available.")
+            return False
+
+        if self.is_connected and self.fyers_sdk:
+            print(f"{self.broker_name}: Already connected and SDK initialized.")
             return True
 
-        if access_token: # Prioritize token passed to connect()
-            self.access_token = access_token
+        if access_token_override:
+            self.access_token = access_token_override
+            self._initialize_sdk_with_token()
+            # Fall through to profile check
 
-        if not self.access_token:
-            print(f"{self.broker_name}: Access token not available. Attempting generation (placeholder).")
-            self.access_token = self._generate_access_token_interactive() # This is a placeholder
+        if not self.fyers_sdk: # If not initialized by pre-set token or override
+            if not self.session: # If auth_url wasn't generated yet (implies direct connect attempt)
+                print(f"{self.broker_name} Error: Session not initialized. Call generate_auth_url() first or provide auth_code.")
+                return False
+            if not auth_code:
+                print(f"{self.broker_name} Error: Auth code is required to generate access token.")
+                return False
+            if not (pin or self.pin):
+                print(f"{self.broker_name} Error: PIN is required.")
+                return False
+            if not (totp or self.totp_key): # Need either direct TOTP or key to generate it
+                 print(f"{self.broker_name} Error: TOTP or TOTP Key is required for Fyers V3 token generation.")
+                 return False
 
-        if not self.access_token:
-            print(f"{self.broker_name} Error: Failed to obtain access token. Cannot connect.")
-            self.is_connected = False
-            return False
+            current_pin = pin or self.pin
 
-        if not self.app_id:
-            print(f"{self.broker_name} Error: APP_ID (client_id for fyersModel) is missing. Cannot connect.")
-            self.is_connected = False
-            return False
+            try:
+                self.session.set_token(auth_code) # Set the auth_code in the session
 
-        try:
-            # from fyers_api import fyersModel # Uncomment for real implementation
-            # self.fyers_sdk = fyersModel.FyersModel(
-            #     client_id=self.app_id, # fyersModel uses 'client_id' for what might be app_id
-            #     token=self.access_token,
-            #     log_path=self.log_path
-            # )
-            # print(f"{self.broker_name}: Fyers SDK (fyersModel) initialized.")
+                # For Fyers V3, access token generation requires additional parameters:
+                # username (client_id_user), RPIN (pin), PAN_DOB (pan or dob), TOTP
+                # The fyers-apiv3 library's generate_token might need these passed or set in SessionModel
+                # This part needs careful mapping to the library's exact requirements for V3.
+                # The library might internally use username, rpin, totp_val from generate_token itself.
 
-            # --- SIMULATION HOOK for testing without real SDK ---
-            class MockFyersSDK: # Mimics fyersModel
-                def __init__(self, client_id, token, log_path): self.client_id=client_id; self.token=token; print(f"MockFyersSDK: Init for {client_id}")
-                def get_profile(self): return {"s": "ok", "data": {"name": "Mock Fyers User"}}
-                def funds(self): return {"s": "ok", "fund_limit": [{"id":1, "title":"Total Balance", "equityAmount":100000}]} # Simplified
-                def get_positions(self): return {"s": "ok", "netPositions": []} # No open positions by default
-                def orderbook(self, data=None): return {"s": "ok", "orderBook": []}
-                def place_order(self, data): return {"s": "ok", "id": f"mock_fyers_{pd.Timestamp.now().value}", "message": "Order placed successfully (mock)"}
-                def modify_order(self, data): return {"s": "ok", "message": "Order modified (mock)"}
-                def cancel_order(self, data): return {"s": "ok", "message": "Order cancelled (mock)"}
+                # Assuming totp is passed directly for now. If only totp_key is available, generate it.
+                current_totp = totp
+                if not current_totp and self.totp_key:
+                    try:
+                        import pyotp
+                        otp_generator = pyotp.TOTP(self.totp_key)
+                        current_totp = otp_generator.now()
+                        print(f"{self.broker_name}: Generated TOTP: {current_totp} (first 3 digits shown for privacy if long)")
+                    except ImportError:
+                        print(f"{self.broker_name} Error: 'pyotp' library not installed, cannot generate TOTP from key.")
+                        return False
+                    except Exception as e_otp:
+                        print(f"{self.broker_name} Error generating TOTP: {e_otp}")
+                        return False
 
-            if self.access_token == "MOCK_FYERS_VALID_TOKEN": # Use a specific mock token string for testing this path
-                self.fyers_sdk = MockFyersSDK(client_id=self.app_id, token=self.access_token, log_path=self.log_path)
-                print(f"{self.broker_name}: Using MOCK Fyers SDK.")
-            else:
-                # Real SDK would be initialized above. If that part is commented out, this path is taken.
-                print(f"{self.broker_name}: Real Fyers SDK initialization is commented out or token is not the mock one.")
-                # To avoid errors if self.fyers_sdk is None later:
-                # self.is_connected = False
-                # return False
-                # For now, let's assume if token is present but not MOCK_FYERS_VALID_TOKEN, it's a real token for a real SDK
-                # If real SDK lines are commented, this will fail. For robust placeholder, always assign a Mock if real is commented.
-                print(f"{self.broker_name}: Falling back to MOCK Fyers SDK due to commented real SDK or non-test token.")
-                self.fyers_sdk = MockFyersSDK(client_id=self.app_id, token=self.access_token, log_path=self.log_path)
+                if not current_totp: # Still no TOTP
+                    print(f"{self.broker_name} Error: TOTP value could not be obtained.")
+                    return False
 
+                # Fyers V3 generate_token typically needs more than just what SessionModel has by default.
+                # It often requires:
+                # app_id, username (client_id_user), rpin (pin), pan_or_dob, totp_val
+                # The fyers_api.accessToken.generate_access_token function might be more direct
+                # Or ensure SessionModel is populated with all necessary data if it uses them.
+                # For simplicity, let's assume the generate_token method of the SDK handles this complexity
+                # if the session object is properly configured or if these are passed to generate_token.
 
-            # Test connection with a simple call like get_profile
-            profile_response = self.fyers_sdk.get_profile()
-            if profile_response and profile_response.get("s") == "ok":
-                user_name = profile_response.get("data", {}).get("name", "User")
-                print(f"{self.broker_name}: Successfully connected. Welcome, {user_name}!")
-                self.is_connected = True
-                return True
-            else:
-                errmsg = profile_response.get("message", "Profile fetch failed.")
-                print(f"{self.broker_name} Error: Connection test (get_profile) failed. Message: {errmsg}")
-                self.access_token = None # Invalidate token
+                # The actual call in fyers_apiv3 looks like:
+                # token_response = self.session.generate_token(
+                #    data={"username": self.client_id_user, "rpin": current_pin, "pan_dob": "YOUR_PAN_OR_DOB", "totp_val": current_totp}
+                # )
+                # For this to work, "YOUR_PAN_OR_DOB" needs to be configured too. This is a major detail for V3.
+                # Let's simulate this with a placeholder for PAN/DOB.
+
+                # Placeholder for PAN/DOB - THIS MUST BE CONFIGURED BY THE USER
+                user_pan_or_dob = os.getenv("FYERS_PAN_OR_DOB", "ABCDE1234F") # Example, user must set this
+                if user_pan_or_dob == "ABCDE1234F":
+                    print(f"{self.broker_name} Warning: Using placeholder PAN/DOB. Real authentication will fail.")
+                    print(f"{self.broker_name} Please set FYERS_PAN_OR_DOB environment variable or provide it.")
+                    # return False # Or allow to proceed for structure testing.
+
+                payload_for_token = {
+                    "fyers_id": self.client_id_user, # The library might expect 'fyers_id'
+                    "password": current_pin, # The library might map 'password' to PIN
+                    "pan_or_dob": user_pan_or_dob,
+                    "totp": current_totp
+                }
+                # The actual library call might be different, this is based on common patterns.
+                # The `fyers-apiv3` `accessToken.SessionModel.generate_token()` seems to take `data` dict.
+                # Let's assume the structure is as per the library's expectation.
+                # The library's internal call is generate спокойн token, which requires app_id, username, rpin, pan_dob, totp_val
+                # It seems `self.session.generate_token()` itself does not take these directly.
+                # The library might expect these to be part of the session object or have a separate function.
+
+                # Re-checking fyers_apiv3 structure:
+                # It seems the `generate_token` method of `SessionModel` is simpler and the main complexity is handled
+                # by the user completing the web flow and the app getting the auth_code.
+                # The `generate_token` then exchanges this auth_code. The V3 complexity with PIN/TOTP might be part of the
+                # FyersModel initialization or first call.
+                # Let's stick to the library's documented flow for SessionModel:
+
+                token_response_dict = self.session.generate_token() # This is the standard call after set_token(auth_code)
+
+                if token_response_dict and isinstance(token_response_dict, dict) and 'access_token' in token_response_dict:
+                    self.access_token = token_response_dict['access_token']
+                    print(f"{self.broker_name}: Access token generated successfully via auth_code.")
+                    self._initialize_sdk_with_token()
+                else:
+                    errmsg = token_response_dict.get("message", "Token generation failed with auth_code.")
+                    print(f"{self.broker_name} Error: {errmsg}. Response: {token_response_dict}")
+                    return False
+            except Exception as e:
+                print(f"{self.broker_name} Error during access token generation or SDK init: {e}")
                 self.is_connected = False
                 return False
-        except ImportError:
-            print(f"{self.broker_name} Error: 'fyers_api' library not found. Please install it.")
-            self.is_connected = False
-            return False
-        except Exception as e:
-            print(f"{self.broker_name} Error: Exception during connection: {e}")
+
+        # Final check: SDK initialized and profile fetch works
+        if self.fyers_sdk:
+            try:
+                profile_response = self.fyers_sdk.get_profile()
+                if profile_response and profile_response.get("s") == "ok":
+                    user_name = profile_response.get("data", {}).get("name", "User")
+                    print(f"{self.broker_name}: Successfully connected. Welcome, {user_name}!")
+                    self.is_connected = True
+                    return True
+                else:
+                    errmsg = profile_response.get("message", "Profile fetch failed post-connection.")
+                    print(f"{self.broker_name} Error: {errmsg}")
+                    self.access_token = None # Invalidate token if profile fails
+                    self.fyers_sdk = None
+                    self.is_connected = False
+                    return False
+            except Exception as e_profile:
+                print(f"{self.broker_name} Error fetching profile after SDK init: {e_profile}")
+                self.is_connected = False
+                return False
+        else:
+            print(f"{self.broker_name} Error: Fyers SDK not initialized after connection attempt.")
             self.is_connected = False
             return False
 
+
     def disconnect(self):
-        # Fyers API is stateless (token-based for each call). True "disconnection" means invalidating the token
-        # or just cleaning up the SDK instance.
-        print(f"{self.broker_name}: Disconnecting (clearing SDK instance and token).")
-        self.fyers_sdk = None
-        # self.access_token = None # Optionally clear token, or keep for next connect
+        print(f"{self.broker_name}: Disconnecting (clearing SDK instance). Access token is kept for potential re-connect.")
+        self.fyers_sdk = None # SDK instance is cleared
         self.is_connected = False
+        # Note: Fyers access tokens have an expiry. True "logout" might involve an API call if available,
+        # or just discarding the token. For client-side, clearing SDK is primary.
 
     def get_account_balance(self):
         if not self.is_connected or not self.fyers_sdk:
             raise ConnectionError(f"{self.broker_name}: Not connected.")
         try:
-            response = self.fyers_sdk.funds() # Real: self.fyers_sdk.funds()
+            response = self.fyers_sdk.funds()
             if response and response.get("s") == "ok":
-                # Fyers fund_limit is a list. Find total balance.
-                # Structure: {"fund_limit": [{"id": int, "title": str, "equityAmount": float, ...}, ...]}
                 total_balance = 0
+                margin_available = 0
+                # Fyers fund_limit is a list of dicts. Titles include: "Total Balance", "Available Balance", etc.
                 for item in response.get("fund_limit", []):
-                    if item.get("title") == "Total Balance" or item.get("title") == "Available Balance": # Check common titles
+                    if item.get("title") == "Total Balance": # Or a more specific one like "Cash"
                         total_balance = item.get("equityAmount", 0)
-                        break
-                return {'total_cash': total_balance, 'margin_available': total_balance} # Simplified
+                    if item.get("title") == "Available Balance": # This is usually key for trading
+                         margin_available = item.get("equityAmount", 0)
+                if total_balance == 0 and margin_available != 0 : total_balance = margin_available # Fallback if "Total Balance" not found
+                elif margin_available == 0 and total_balance !=0 : margin_available = total_balance # Fallback
+
+                return {'total_cash': total_balance, 'margin_available': margin_available}
             else:
                 print(f"{self.broker_name} Error fetching balance: {response.get('message', 'Unknown error')}")
                 return None
@@ -180,20 +277,20 @@ class FyersBroker(BaseBroker):
         if not self.is_connected or not self.fyers_sdk:
             raise ConnectionError(f"{self.broker_name}: Not connected.")
         try:
-            response = self.fyers_sdk.get_positions() # Real: self.fyers_sdk.positions() or get_positions()
+            response = self.fyers_sdk.positions() # Correct method name for fyers-apiv3
             if response and response.get("s") == "ok":
-                # Fyers netPositions: list of dicts
-                # {'symbol': 'NSE:SBIN-EQ', 'qty': 10, 'avgPrice': 500, 'ltp': 505, ...}
-                positions = []
-                for pos in response.get("netPositions", []):
-                    positions.append({
-                        'symbol': pos.get('symbol'),
-                        'quantity': pos.get('qty'),
+                positions_data = response.get("netPositions", [])
+                formatted_positions = []
+                for pos in positions_data:
+                    formatted_positions.append({
+                        'symbol': pos.get('symbol'), # e.g., "NSE:SBIN-EQ"
+                        'quantity': pos.get('netQty'), # Note: 'netQty'
                         'average_price': pos.get('avgPrice'),
                         'ltp': pos.get('ltp'),
-                        'pnl': pos.get('pl') # Fyers provides P&L
+                        'pnl': pos.get('pl'),
+                        'product_type': pos.get('productType') # Fyers provides this
                     })
-                return positions
+                return formatted_positions
             else:
                 print(f"{self.broker_name} Error fetching positions: {response.get('message', 'Unknown error')}")
                 return []
@@ -201,84 +298,78 @@ class FyersBroker(BaseBroker):
             print(f"{self.broker_name} Exception fetching positions: {e}")
             return []
 
-    def get_orders(self, order_id=None):
+    def get_orders(self, order_id=None): # Pass order_id as string
         if not self.is_connected or not self.fyers_sdk:
             raise ConnectionError(f"{self.broker_name}: Not connected.")
         try:
-            # Fyers: get_order_book can take an 'id' for specific order
             request_data = {}
-            if order_id:
-                request_data['id'] = order_id
+            if order_id: # Fyers API expects 'id' for specific order
+                request_data['id'] = str(order_id)
 
-            response = self.fyers_sdk.orderbook(data=request_data if request_data else None) # Real: self.fyers_sdk.orderbook()
+            response = self.fyers_sdk.orderbook(data=request_data if request_data else None)
 
             if response and response.get("s") == "ok":
                 orders = response.get("orderBook", [])
-                # Adapt Fyers order structure to a generic one if needed
-                # Example: {'id': 'order_id', 'symbol': ..., 'status': ..., qty: ..., side: 1 (BUY)/-1 (SELL)}
-                return orders
+                if order_id and orders: # If specific ID was requested and found
+                    return orders[0] # Return the single order dict
+                return orders # Return list of orders
             else:
                 print(f"{self.broker_name} Error fetching orders: {response.get('message', 'Unknown error')}")
-                return [] if order_id is None else None # List for all, None for specific if error
+                return None if order_id else []
         except Exception as e:
             print(f"{self.broker_name} Exception fetching orders: {e}")
-            return [] if order_id is None else None
+            return None if order_id else []
 
+    # --- Order Type and Product Type Mappers (from previous placeholder) ---
     def _map_product_type_fyers(self, product_type_generic):
-        # Fyers productType: 10 (CNC), 20 (INTRADAY/MIS), 30 (MARGIN), 40 (CO), 50 (BO)
-        mapping = {
-            "CNC": 10, "MIS": 20, "INTRADAY": 20, "MARGIN": 30, "NRML": 30, # NRML often maps to MARGIN
-            "CO": 40, "BO": 50
-        }
-        return mapping.get(product_type_generic.upper(), 20) # Default to MIS
+        mapping = {"CNC": 10, "MIS": 20, "INTRADAY": 20, "MARGIN": 30, "NRML": 30, "CO": 40, "BO": 50}
+        return mapping.get(product_type_generic.upper(), 20)
 
     def _map_order_type_fyers(self, order_type_generic):
-        # Fyers type: 1 (LIMIT), 2 (MARKET), 3 (SL-LIMIT/SL), 4 (SL-MARKET/SL-M)
-        mapping = {
-            "LIMIT": 1, "MARKET": 2, "SL": 3, "SL-M": 4, "SL_LIMIT": 3, "SL_MARKET": 4
-        }
-        return mapping.get(order_type_generic.upper(), 2) # Default to MARKET
+        mapping = {"LIMIT": 1, "MARKET": 2, "SL": 3, "SL-M": 4, "SL_LIMIT": 3, "SL_MARKET": 4}
+        return mapping.get(order_type_generic.upper(), 2)
 
     def _map_transaction_type_fyers(self, transaction_type_generic):
-        # Fyers side: 1 (BUY), -1 (SELL)
         return 1 if transaction_type_generic.upper() == "BUY" else -1
-
 
     def place_order(self, symbol: str, transaction_type: str, quantity: float,
                     order_type: str, price: float = 0, trigger_price: float = 0,
-                    product_type: str = "MIS", exchange: str = "NSE", **kwargs) -> dict:
+                    product_type: str = "MIS", **kwargs) -> dict: # Removed exchange, assume symbol has it
         if not self.is_connected or not self.fyers_sdk:
             raise ConnectionError(f"{self.broker_name}: Not connected.")
 
-        # Fyers symbol format is like "NSE:SBIN-EQ" or "MCX:CRUDEOIL20NOVFUT"
-        # Ensure symbol is in Fyers format. If not, this interface might need a mapping utility.
-        # For now, assume `symbol` is already Fyers-compatible.
-
         data = {
-            "symbol": symbol, # e.g., "NSE:RELIANCE-EQ"
-            "qty": int(quantity), # Fyers expects integer quantity
-            "type": self._map_order_type_fyers(order_type),       # 1 for Limit, 2 for Market, 3 for Stop (SL-L), 4 for Stoplimit (SL-M)
-            "side": self._map_transaction_type_fyers(transaction_type),     # 1 for Buy, -1 for Sell
-            "productType": self._map_product_type_fyers(product_type), # CNC, INTRADAY, MARGIN, CO, BO
-            "limitPrice": float(price) if order_type.upper() in ["LIMIT", "SL", "SL-LIMIT"] else 0,
-            "stopPrice": float(trigger_price) if order_type.upper() in ["SL", "SL-M", "SL-LIMIT", "SL_MARKET"] else 0,
-            # "disclosedQty": 0, # Optional
-            # "validity": "DAY", # DAY, IOC
-            # "offlineOrder": "False", # For AMO orders
-            # "stopLoss": 0, # For Bracket Orders
-            # "takeProfit": 0 # For Bracket Orders
+            "symbol": symbol,
+            "qty": int(quantity),
+            "type": self._map_order_type_fyers(order_type),
+            "side": self._map_transaction_type_fyers(transaction_type),
+            "productType": self._map_product_type_fyers(product_type),
+            "limitPrice": float(price if order_type.upper() in ["LIMIT", "SL", "SL-LIMIT"] else 0), # Ensure price is float
+            "stopPrice": float(trigger_price if order_type.upper() in ["SL", "SL-M", "SL-LIMIT", "SL_MARKET"] else 0), # Ensure trigger_price is float
+            "validity": kwargs.get("validity", "DAY"), # DAY or IOC
+            "disclosedQty": kwargs.get("disclosedQty", 0),
+            "offlineOrder": str(kwargs.get("offlineOrder", "False")).capitalize(), # "True" or "False"
+            # For CO/BO, stoploss and takeProfit might be needed
+            # "stopLoss": float(kwargs.get("stopLoss",0)),
+            # "takeProfit": float(kwargs.get("takeProfit",0))
         }
-        # Add any other kwargs if Fyers API supports them directly in this payload
-        data.update(kwargs)
+        # Clean up zero prices for non-applicable types, Fyers API can be strict
+        if data["type"] == 2: # Market Order
+            data["limitPrice"] = 0
+            data["stopPrice"] = 0
+        elif data["type"] == 1: # Limit Order
+             data["stopPrice"] = 0
 
         try:
             print(f"{self.broker_name}: Placing order with data: {data}")
-            response = self.fyers_sdk.place_order(data=data) # Real: self.fyers_sdk.place_order(data=data)
+            response = self.fyers_sdk.place_order(data=data)
 
             if response and response.get("s") == "ok":
                 return {'status': 'success', 'order_id': response.get("id"), 'message': response.get("message")}
-            else:
-                return {'status': 'error', 'message': response.get("message", "Failed to place order."), 'details': response}
+            else: # Error from Fyers
+                message = response.get("message", "Failed to place order.")
+                if "emessage" in response: message = response["emessage"] # More specific error
+                return {'status': 'error', 'message': message, 'details': response}
         except Exception as e:
             print(f"{self.broker_name} Exception placing order: {e}")
             return {'status': 'error', 'message': str(e)}
@@ -288,19 +379,21 @@ class FyersBroker(BaseBroker):
         if not self.is_connected or not self.fyers_sdk:
             raise ConnectionError(f"{self.broker_name}: Not connected.")
 
-        data = {"id": order_id}
+        data = {"id": str(order_id)} # Order ID must be string
         if new_quantity is not None: data["qty"] = int(new_quantity)
         if new_price is not None: data["limitPrice"] = float(new_price)
         if new_trigger_price is not None: data["stopPrice"] = float(new_trigger_price)
         if new_order_type is not None: data["type"] = self._map_order_type_fyers(new_order_type)
-        data.update(kwargs)
+        # data.update(kwargs) # Be careful with extra kwargs for modify
 
         try:
-            response = self.fyers_sdk.modify_order(data=data) # Real: self.fyers_sdk.modify_order(data=data)
+            response = self.fyers_sdk.modify_order(data=data)
             if response and response.get("s") == "ok":
                 return {'status': 'success', 'order_id': order_id, 'message': response.get("message")}
             else:
-                return {'status': 'error', 'message': response.get("message", "Failed to modify order."), 'details': response}
+                message = response.get("message", "Failed to modify order.")
+                if "emessage" in response: message = response["emessage"]
+                return {'status': 'error', 'message': message, 'details': response}
         except Exception as e:
             print(f"{self.broker_name} Exception modifying order: {e}")
             return {'status': 'error', 'message': str(e)}

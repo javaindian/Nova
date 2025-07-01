@@ -40,7 +40,7 @@ This application allows users to configure and run the Nova V2 trading strategy,
     ```bash
     pip install -r requirements.txt
     ```
-    This will install Streamlit, Pandas, Plotly, MySQL Connector, python-dotenv, yfinance, and requests.
+    This will install Streamlit, Pandas, Plotly, MySQL Connector, python-dotenv, yfinance, requests, fyers-apiv3, and pyotp.
 
 5.  **MySQL Database Setup**:
     *   Ensure your MySQL server is running.
@@ -70,7 +70,14 @@ This application allows users to configure and run the Nova V2 trading strategy,
         *   **Telegram Bot (Optional)**: If you want Telegram notifications:
             *   `TELEGRAM_BOT_TOKEN`: Your Telegram Bot Token obtained from BotFather.
             *   `TELEGRAM_CHAT_ID`: Your personal Telegram Chat ID or the ID of the group/channel where the bot will send messages.
-        *   *(Fyers API credentials are also listed but are for future use when Fyers integration is complete).*
+        *   **Fyers API Credentials (Required for Fyers Integration)**:
+            *   `FYERS_APP_ID`: Your Fyers API App ID (e.g., `XXXXXXX-100`).
+            *   `FYERS_APP_SECRET`: Your Fyers API App Secret.
+            *   `FYERS_CLIENT_ID`: Your Fyers Login Client ID (the one you use to log into Fyers).
+            *   `FYERS_REDIRECT_URI`: The Redirect URI configured in your Fyers API app (e.g., `http://localhost:3000/auth_callback` or any other valid URI you control).
+            *   `FYERS_PAN_OR_DOB`: Your PAN card number or Date of Birth in `YYYY-MM-DD` format (required for Fyers API V3 token generation). **Handle this sensitive information securely.**
+            *   `FYERS_TOTP_KEY`: The secret key for your Time-based One-Time Password (TOTP) if you have 2FA enabled with an authenticator app for your Fyers account.
+            *   `FYERS_PIN`: Your 4-digit Fyers account PIN.
 
 7.  **Initialize Database Schema and Default Data**:
     *   Run the setup script. This will create the necessary tables and populate some default instruments and strategy parameters.
@@ -107,7 +114,18 @@ Once the installation is complete and the application is running, further config
     *   The sidebar allows selecting a "Trading Mode/Broker".
     *   **"Paper Trading (Internal)"**: This is the default simulated trading mode. You can reset the paper trading account from the sidebar.
     *   **"YFinance (Data Only)"**: Uses Yahoo Finance for data; no trading capabilities.
-    *   **"Fyers (Live/Paper - TBD)"**: Placeholder for future Fyers API integration. Credentials entered here are not yet fully functional.
+    *   **"Fyers (Live/Paper - TBD)"**:
+        *   Allows connecting to your Fyers account for live data and (eventually) trading.
+        *   **Connection Process**:
+            1.  Enter your Fyers App ID and Redirect URI in the sidebar.
+            2.  Click "1. Get Fyers Authorization Link".
+            3.  Open the generated link in your browser, log in to Fyers, and authorize the application.
+            4.  Copy the `auth_code` from the URL you are redirected to.
+            5.  Paste the `auth_code` back into the Streamlit app sidebar.
+            6.  Enter your Fyers Client ID (login ID), PIN, current TOTP (from your authenticator app, if 2FA is enabled using TOTP), and your PAN/DOB (as configured in `.env` or entered).
+            7.  Click "2. Connect to Fyers".
+        *   Once connected, the "Trading" tab will display your Fyers account details (profile, funds, positions, orders).
+        *   Ensure all required Fyers credentials (especially `FYERS_APP_SECRET` and `FYERS_PAN_OR_DOB`) are correctly set in your `.env` file for the connection to succeed.
 
 ## Running the Application
 

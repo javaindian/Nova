@@ -21,6 +21,7 @@ except ImportError: # Fallback for direct execution within app directory (less i
     from app.strategies.nova_strategy import NovaStrategy
     from app.data_fetchers.yfinance_fetcher import YFinanceFetcher
     from app.brokers.paper_broker import PaperBroker
+import os # Added for os.getenv in Fyers UI section
 
 
 # --- Page Configuration ---
@@ -134,10 +135,24 @@ if 'current_instrument_exchange' not in st.session_state: st.session_state.curre
 if 'current_instrument_asset_type' not in st.session_state: st.session_state.current_instrument_asset_type = ""
 
 # Active Broker State
-if 'active_broker_name' not in st.session_state: st.session_state.active_broker_name = "YFinance (Data Only)" # Default to YF
+if 'active_broker_name' not in st.session_state: st.session_state.active_broker_name = "YFinance (Data Only)"
 if 'active_broker_instance' not in st.session_state: st.session_state.active_broker_instance = None
+
+# Fyers Broker instance (initialized once)
+if 'fyers_broker' not in st.session_state:
+    from app.brokers.fyers_broker import FyersBroker # Import FyersBroker
+    # Credentials for FyersBroker will be loaded from env or passed via UI
+    st.session_state.fyers_broker = FyersBroker()
+
 if st.session_state.active_broker_name == "Paper Trading (Internal)" and st.session_state.active_broker_instance is None:
     st.session_state.active_broker_instance = st.session_state.paper_broker
+elif st.session_state.active_broker_name == "Fyers (Live/Paper - TBD)" and st.session_state.active_broker_instance is None:
+    # Only set as active instance if connected. Connection happens via UI.
+    if st.session_state.fyers_broker.is_connected:
+        st.session_state.active_broker_instance = st.session_state.fyers_broker
+    else:
+        st.session_state.active_broker_instance = None # Explicitly None if not connected
+
 
 # Watchlist filter state
 if 'filter_favorites_only' not in st.session_state:
@@ -145,24 +160,26 @@ if 'filter_favorites_only' not in st.session_state:
 
 # Telegram Notifier State (initialized once)
 if 'telegram_notifier' not in st.session_state:
-    # Attempt to load from DB config first, then env vars (handled by TelegramNotifier constructor)
-    # For now, TelegramNotifier will try env vars if DB values are not explicitly passed from a settings load.
-    # We'll add DB loading for token/chat_id in the settings tab.
     from app.notifications.telegram_bot import TelegramNotifier
-    # Initialize without specific token/chat_id; it will try to use env vars or be configured via UI
     st.session_state.telegram_notifier = TelegramNotifier()
 
 # Alert Log State
 if 'alert_log' not in st.session_state:
-    st.session_state.alert_log = [] # List to store alert messages (timestamp, type, message)
+    st.session_state.alert_log = []
+
+# Fyers Auth URL state
+if 'fyers_auth_url' not in st.session_state:
+    st.session_state.fyers_auth_url = None
+
 
 # --- Global Instances (from session state for easy access) ---
 db_manager = st.session_state.db_manager
 data_fetcher_yf = st.session_state.data_fetcher_yf
 nova_strategy = st.session_state.nova_strategy
 paper_broker = st.session_state.paper_broker
+fyers_broker = st.session_state.fyers_broker # Now always initialized
 telegram_notifier = st.session_state.telegram_notifier
-# fyers_broker = st.session_state.fyers_broker # When ready
+
 
 # --- Alerting Function ---
 def add_alert(alert_type: str, message: str, send_telegram=True):
@@ -296,28 +313,35 @@ current_ui_params['atr_multiplier'] = st.sidebar.slider(
     step=0.1,
     help=nova_strategy.get_default_params().get('atr_multiplier_description', "Multiplier for ATR in band calculation")
 )
+# Slider for 'mtfa_ema_length'
+current_ui_params['mtfa_ema_length'] = st.sidebar.slider(
+    "MTFA EMA Length (mtfa_ema_length)", min_value=5, max_value=200,
+    value=int(current_ui_params.get('mtfa_ema_length', param_config.get('mtfa_ema_length'))),
+    help=nova_strategy.get_default_params().get('mtfa_ema_length_description', "EMA length for higher timeframe trend confirmation")
+)
 
 
 if st.sidebar.button("Apply & Save Parameters"):
     try:
+        # Include MTFA EMA length in parameters passed to strategy
+        # current_ui_params is already being updated by the sliders directly
         nova_strategy.set_params(current_ui_params) # This also validates
 
-        # Convert to the format expected by db_manager.save_strategy_params
-        # {'param_name': {'value': 'val', 'type': 'INT', 'description': 'desc'}, ...}
         params_to_save_db = {}
         for k, v in current_ui_params.items():
             param_type = 'JSON' if isinstance(v, list) else \
                          'FLOAT' if isinstance(v, float) else \
                          'INT' if isinstance(v, int) else \
                          'BOOLEAN' if isinstance(v, bool) else 'STRING'
-            params_to_save_db[k] = {'value': v, 'type': param_type, 'description': f'{k} for NovaV2'} # Add actual descriptions later
+            # Ensure all keys from current_ui_params are added to params_to_save_db
+            params_to_save_db[k] = {'value': v, 'type': param_type, 'description': f'{k} for NovaV2'}
 
         db_manager.save_strategy_params(nova_strategy.strategy_name, params_to_save_db)
         st.sidebar.success(f"{nova_strategy.strategy_name} parameters applied and saved to DB!")
-        st.experimental_rerun() # Rerun to reflect changes immediately in chart logic
+        st.experimental_rerun()
     except ValueError as e:
         st.sidebar.error(f"Error in parameters: {e}")
-        add_alert("ERROR", f"Parameter validation error: {e}", send_telegram=False) # Don't spam telegram for UI errors
+        add_alert("ERROR", f"Parameter validation error: {e}", send_telegram=False)
 
 
 # Broker Connection & Controls
@@ -352,14 +376,147 @@ if selected_broker_name != st.session_state.active_broker_name: # If selection c
     st.experimental_rerun()
 
 
+# Fyers Connection UI in Sidebar
 if st.session_state.active_broker_name == "Fyers (Live/Paper - TBD)":
-    fyers_api_key = st.sidebar.text_input("Fyers API Key", type="password", key="fyers_api_key_input")
-    fyers_api_secret = st.sidebar.text_input("Fyers API Secret", type="password", key="fyers_api_secret_input")
-    # Add other Fyers specific inputs like client_id, totp_key, pin if needed for connection
-    if st.sidebar.button("Connect Fyers"):
-        st.sidebar.info(f"Fyers connection attempt - TBD.")
-        # Here you would call: fyers_broker.connect(api_key=fyers_api_key, ...)
-        # And update st.session_state.active_broker_instance = fyers_broker if successful
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("Fyers Connection")
+
+    if not fyers_broker.is_connected:
+        # Load credentials from .env or db_config for pre-fill if available
+        # These should ideally be loaded into fyers_broker instance upon its initialization if possible,
+        # or fetched here for pre-filling UI fields.
+        env_fyers_app_id = os.getenv('FYERS_APP_ID', "")
+        env_fyers_secret_key = os.getenv('FYERS_APP_SECRET', "") # Not directly used for login UI usually
+        env_fyers_client_id_user = os.getenv('FYERS_CLIENT_ID', "")
+        env_fyers_redirect_uri = os.getenv('FYERS_REDIRECT_URI', "http://localhost:3000/auth_callback") # Example
+        env_fyers_pan_dob = os.getenv('FYERS_PAN_OR_DOB',"") # Crucial for V3
+        env_fyers_totp_key = os.getenv('FYERS_TOTP_KEY',"") # For generating TOTP
+
+        # UI Inputs for Fyers Credentials needed for auth URL generation and token generation
+        # Some of these might be fixed per app registration (app_id, secret, redirect_uri)
+        # Others are user-specific (client_id_user, pin, totp_key, pan_dob)
+
+        fyers_app_id_ui = st.sidebar.text_input("Fyers App ID (Client ID of your API App)", value=fyers_broker.app_id or env_fyers_app_id, key="fyers_app_id_ui")
+        # fyers_secret_key_ui = st.sidebar.text_input("Fyers App Secret", value=fyers_broker.app_secret or env_fyers_secret_key, type="password", key="fyers_secret_key_ui") # Secret is for backend
+        fyers_redirect_uri_ui = st.sidebar.text_input("Fyers Redirect URI", value=fyers_broker.redirect_uri or env_fyers_redirect_uri, key="fyers_redirect_uri_ui")
+
+        if st.sidebar.button("1. Get Fyers Authorization Link", key="fyers_get_auth_link"):
+            if not all([fyers_app_id_ui, fyers_broker.app_secret, fyers_redirect_uri_ui]): # Check essential for auth URL
+                st.sidebar.error("App ID, App Secret (from env/config), and Redirect URI are needed to generate auth link.")
+            else:
+                # Update broker instance with UI values if they differ, before generating URL
+                fyers_broker.app_id = fyers_app_id_ui
+                fyers_broker.redirect_uri = fyers_redirect_uri_ui
+                # App Secret should be loaded from env by fyers_broker or passed securely, not usually from UI input field
+
+                auth_url = fyers_broker.generate_auth_url(state="mystate123")
+                if auth_url:
+                    st.session_state.fyers_auth_url = auth_url
+                    st.sidebar.info("Authorization link generated. See below.")
+                    add_alert("INFO", "Fyers Auth URL generated. User action required.", send_telegram=False)
+                else:
+                    st.sidebar.error("Failed to generate Fyers auth link. Check credentials and console.")
+                    add_alert("ERROR", "Failed to generate Fyers Auth URL.", send_telegram=True)
+
+        if st.session_state.fyers_auth_url:
+            st.sidebar.markdown(f"**Open this link in your browser, log in, authorize, then copy the `auth_code` from the redirect URL (it will be in the address bar after `?auth_code=xxxxxx`).**")
+            st.sidebar.text_area("Auth URL (Copy & Paste into Browser)", st.session_state.fyers_auth_url, height=100, key="fyers_auth_url_display")
+
+        fyers_auth_code_ui = st.sidebar.text_input("Paste Auth Code Here", key="fyers_auth_code_input")
+        fyers_client_id_user_ui = st.sidebar.text_input("Your Fyers Client ID (Login ID)", value=fyers_broker.client_id_user or env_fyers_client_id_user, key="fyers_client_id_user_ui")
+        fyers_pin_ui = st.sidebar.text_input("Your Fyers PIN (4-digit)", value=fyers_broker.pin or "", type="password", key="fyers_pin_ui")
+        fyers_totp_ui = st.sidebar.text_input("Current TOTP (6-digit from Auth App)", key="fyers_totp_ui", help="Required if 2FA via TOTP is enabled.")
+        # PAN/DOB is sensitive, ideally from .env or secure config, not direct UI input for repeated use.
+        # For this connection step, it might be okay if not stored persistently from this field.
+        fyers_pan_dob_ui = st.sidebar.text_input("Your PAN or DOB (YYYY-MM-DD)", value=os.getenv("FYERS_PAN_OR_DOB",""), type="password", key="fyers_pan_dob_ui_input", help="Required for V3 token generation.")
+
+
+        if st.sidebar.button("2. Connect to Fyers", key="fyers_connect_btn"):
+            if not fyers_auth_code_ui:
+                st.sidebar.error("Auth Code is required.")
+            elif not fyers_client_id_user_ui:
+                st.sidebar.error("Fyers Client ID (Login ID) is required.")
+            elif not fyers_pin_ui:
+                st.sidebar.error("Fyers PIN is required.")
+            elif not fyers_totp_ui : # TOTP is generally required for V3 via API
+                st.sidebar.error("Current TOTP is required.")
+            elif not fyers_pan_dob_ui:
+                 st.sidebar.error("PAN or DOB is required for V3 token generation.")
+            else:
+                with st.spinner("Attempting to connect to Fyers..."):
+                    # Update fyers_broker instance with any credentials from UI just before connect
+                    fyers_broker.app_id = fyers_app_id_ui
+                    fyers_broker.redirect_uri = fyers_redirect_uri_ui
+                    fyers_broker.client_id_user = fyers_client_id_user_ui
+                    fyers_broker.pin = fyers_pin_ui
+                    # PAN/DOB and TOTP_KEY are sensitive, best from .env.
+                    # If fyers_broker is designed to use its own `self.totp_key` to generate TOTP,
+                    # then direct `totp` value from UI might be an alternative.
+                    # The FyersBroker.connect() method has logic for this.
+
+                    # Store PAN/DOB temporarily for this session if entered, but don't save to general app_config via UI
+                    # It's better if FyersBroker reads it from its own env var source.
+                    # For now, we assume FyersBroker's connect method will handle it if self.pan_or_dob is set.
+                    # We might need to explicitly pass it:
+                    # os.environ['FYERS_PAN_OR_DOB'] = fyers_pan_dob_ui # Not ideal to set env var here
+
+                    # The FyersBroker's connect method should use its instance variables (self.pin, self.totp_key)
+                    # or accept pin, totp as direct arguments.
+                    # The current FyersBroker.connect takes auth_code, pin, totp.
+
+                    # Update fyers_broker instance attributes before calling connect
+                    fyers_broker.pin = fyers_pin_ui
+                    # If your FyersBroker uses self.totp_key to generate TOTP, ensure it's set.
+                    # If it expects direct TOTP, pass fyers_totp_ui.
+                    # The current FyersBroker.connect has logic for pyotp if self.totp_key is set.
+                    # So, ensure fyers_broker.totp_key is loaded from env.
+
+                    # Critical: The `fyers_broker` instance needs its `app_secret` set, typically from `os.getenv` in its `__init__`.
+                    # The `SessionModel` within `fyers_broker.generate_auth_url` and `fyers_broker.connect` (for token exchange) needs this.
+                    if not fyers_broker.app_secret:
+                        st.sidebar.error("Fyers App Secret is missing in configuration. Cannot generate token.")
+                        st.stop()
+
+                    # For PAN/DOB, it's best practice if FyersBroker loads this from os.getenv('FYERS_PAN_OR_DOB') itself.
+                    # If fyers_pan_dob_ui is provided, we could temporarily set it as an environment variable for the SDK to pick up,
+                    # but this is not clean. Best if SDK takes it as a direct param or FyersBroker handles it.
+                    # For now, let's assume fyers_broker.connect or its internals will handle PAN/DOB if required by SDK,
+                    # possibly using an env var `FYERS_PAN_OR_DOB` that the user must set.
+                    # The `fyers_broker.py` was modified to use os.getenv("FYERS_PAN_OR_DOB", "ABCDE1234F")
+                    # So, if user fills fyers_pan_dob_ui, we should ensure that value is used.
+                    # A temporary override could be:
+                    original_env_pan_dob = os.getenv("FYERS_PAN_OR_DOB")
+                    if fyers_pan_dob_ui: os.environ["FYERS_PAN_OR_DOB"] = fyers_pan_dob_ui
+
+
+                    connect_success = fyers_broker.connect(
+                        auth_code=fyers_auth_code_ui,
+                        pin=fyers_pin_ui, # Passed directly
+                        totp=fyers_totp_ui  # Passed directly
+                    )
+
+                    if fyers_pan_dob_ui and original_env_pan_dob is not None: # Restore original env var if it existed
+                        os.environ["FYERS_PAN_OR_DOB"] = original_env_pan_dob
+                    elif fyers_pan_dob_ui and original_env_pan_dob is None: # Unset if it was not set before
+                        del os.environ["FYERS_PAN_OR_DOB"]
+
+
+                    if connect_success:
+                        st.session_state.active_broker_instance = fyers_broker
+                        st.session_state.fyers_auth_url = None # Clear auth URL
+                        st.sidebar.success("Successfully connected to Fyers!")
+                        add_alert("INFO", "Connected to Fyers API successfully.")
+                        st.experimental_rerun()
+                    else:
+                        st.sidebar.error(f"Fyers connection failed. Check details and console. Message: {fyers_broker.params.get('last_error', 'Unknown error')}")
+                        add_alert("ERROR", f"Fyers API connection failed: {fyers_broker.params.get('last_error', 'Ensure all credentials including PAN/DOB and TOTP are correct.')}")
+    else: # Fyers broker is connected
+        st.sidebar.success(f"Connected to Fyers as {fyers_broker.fyers_sdk.get_profile().get('data',{}).get('name', 'user') if fyers_broker.fyers_sdk else 'N/A'}")
+        if st.sidebar.button("Disconnect Fyers", key="fyers_disconnect_btn"):
+            fyers_broker.disconnect()
+            st.session_state.active_broker_instance = None
+            add_alert("INFO", "Disconnected from Fyers API.")
+            st.experimental_rerun()
 
 # Display current paper broker balance if active
 if st.session_state.active_broker_name == "Paper Trading (Internal)" and paper_broker:
