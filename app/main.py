@@ -296,28 +296,35 @@ current_ui_params['atr_multiplier'] = st.sidebar.slider(
     step=0.1,
     help=nova_strategy.get_default_params().get('atr_multiplier_description', "Multiplier for ATR in band calculation")
 )
+# Slider for 'mtfa_ema_length'
+current_ui_params['mtfa_ema_length'] = st.sidebar.slider(
+    "MTFA EMA Length (mtfa_ema_length)", min_value=5, max_value=200,
+    value=int(current_ui_params.get('mtfa_ema_length', param_config.get('mtfa_ema_length'))),
+    help=nova_strategy.get_default_params().get('mtfa_ema_length_description', "EMA length for higher timeframe trend confirmation")
+)
 
 
 if st.sidebar.button("Apply & Save Parameters"):
     try:
+        # Include MTFA EMA length in parameters passed to strategy
+        # current_ui_params is already being updated by the sliders directly
         nova_strategy.set_params(current_ui_params) # This also validates
 
-        # Convert to the format expected by db_manager.save_strategy_params
-        # {'param_name': {'value': 'val', 'type': 'INT', 'description': 'desc'}, ...}
         params_to_save_db = {}
         for k, v in current_ui_params.items():
             param_type = 'JSON' if isinstance(v, list) else \
                          'FLOAT' if isinstance(v, float) else \
                          'INT' if isinstance(v, int) else \
                          'BOOLEAN' if isinstance(v, bool) else 'STRING'
-            params_to_save_db[k] = {'value': v, 'type': param_type, 'description': f'{k} for NovaV2'} # Add actual descriptions later
+            # Ensure all keys from current_ui_params are added to params_to_save_db
+            params_to_save_db[k] = {'value': v, 'type': param_type, 'description': f'{k} for NovaV2'}
 
         db_manager.save_strategy_params(nova_strategy.strategy_name, params_to_save_db)
         st.sidebar.success(f"{nova_strategy.strategy_name} parameters applied and saved to DB!")
-        st.experimental_rerun() # Rerun to reflect changes immediately in chart logic
+        st.experimental_rerun()
     except ValueError as e:
         st.sidebar.error(f"Error in parameters: {e}")
-        add_alert("ERROR", f"Parameter validation error: {e}", send_telegram=False) # Don't spam telegram for UI errors
+        add_alert("ERROR", f"Parameter validation error: {e}", send_telegram=False)
 
 
 # Broker Connection & Controls

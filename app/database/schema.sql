@@ -51,6 +51,7 @@ CREATE TABLE IF NOT EXISTS strategy_params (
 -- ('NovaV2', 'atr_period', '50', 'INT', 'Period for ATR calculation'),
 -- ('NovaV2', 'atr_sma_period', '50', 'INT', 'Period for SMA of ATR'),
 -- ('NovaV2', 'atr_multiplier', '0.8', 'FLOAT', 'Multiplier for ATR value in bands'),
+-- ('NovaV2', 'mtfa_ema_length', '20', 'INT', 'EMA length for Multi-Timeframe Analysis confirmation'),
 -- ('NovaV2', 'primary_timeframe', '15m', 'STRING', 'Default primary timeframe for the strategy'),
 -- ('NovaV2', 'secondary_timeframes', '["1h", "4h"]', 'JSON', 'Default secondary timeframes for confirmation');
 
@@ -69,6 +70,7 @@ CREATE TABLE IF NOT EXISTS signals (
     tp3 DECIMAL(18,8),                  -- Take Profit 3
     atr_value DECIMAL(18,8),            -- ATR value at the time of signal
     confidence FLOAT,                   -- Optional: AI predicted confidence (0.0 to 1.0)
+    mtfa_confirmed BOOLEAN DEFAULT NULL, -- Indicates if Multi-Timeframe Analysis condition was met
     status ENUM('NEW','ACTIVE','TRIGGERED','CANCELLED','SL_HIT','TP_HIT','EXPIRED') DEFAULT 'NEW',
     strategy_version VARCHAR(20) DEFAULT 'NovaV2_1.0', -- Version of the strategy logic
     details TEXT,                       -- Store additional JSON details like indicator values

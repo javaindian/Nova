@@ -30,8 +30,7 @@ class NovaStrategy(BaseStrategy):
             'atr_period': 50,
             'atr_sma_period': 50,
             'atr_multiplier': 0.8,
-            # Optional: 'primary_timeframe', 'secondary_timeframes' can be managed by the app
-            # but not directly used in core signal generation maths here unless explicitly passed.
+            'mtfa_ema_length': 20, # Default for higher timeframe EMA confirmation
         }
 
     def _validate_params(self):
@@ -40,7 +39,8 @@ class NovaStrategy(BaseStrategy):
             'target_offset': int,
             'atr_period': int,
             'atr_sma_period': int,
-            'atr_multiplier': float
+            'atr_multiplier': float,
+            'mtfa_ema_length': int,
         }
         for key, expected_type in required_keys_types.items():
             if key not in self.params:
@@ -153,10 +153,20 @@ class NovaStrategy(BaseStrategy):
         if df_primary.empty:
             return []
 
-        data = self._calculate_indicators(df_primary.copy())
+        data = self._calculate_indicators(df_primary.copy()) # Primary TF indicators
 
-        # Determine trend
-        # Initialize trend column, default to NaN or previous trend
+        # MTFA: Calculate and align higher timeframe EMA
+        if df_higher_tf is not None and not df_higher_tf.empty:
+            htf_ema_length = self.params.get('mtfa_ema_length', 20) # Get from params
+            # Calculate EMA on the 'close' of the higher timeframe data
+            htf_ema = df_higher_tf.ta.ema(close=df_higher_tf['close'], length=htf_ema_length)
+            # Align htf_ema to primary dataframe's index by reindexing and forward-filling
+            data['htf_ema'] = htf_ema.reindex(data.index, method='ffill')
+        else:
+            data['htf_ema'] = np.nan # Or some other indicator that it's not available
+
+        # Determine trend (on primary timeframe data)
+        # Initialize trend column
         data['trend_up'] = False # True if current trend is up
 
         # Conditions for trend change
@@ -201,26 +211,32 @@ class NovaStrategy(BaseStrategy):
         target_offset = self.params['target_offset']
 
         for i in range(len(data)):
+            # MTFA Confirmation Check
+            mtfa_confirmed_signal = None
+            if not pd.isna(data['htf_ema'].iloc[i]): # Check if htf_ema is available
+                if signal_up.iloc[i] and data['close'].iloc[i] > data['htf_ema'].iloc[i]:
+                    mtfa_confirmed_signal = True
+                elif signal_down.iloc[i] and data['close'].iloc[i] < data['htf_ema'].iloc[i]:
+                    mtfa_confirmed_signal = True
+                elif signal_up.iloc[i] or signal_down.iloc[i]: # Signal exists but MTFA condition not met
+                    mtfa_confirmed_signal = False
+            # If htf_ema is NaN (not available), mtfa_confirmed_signal remains None (neutral/not applicable)
+
             signal_details = {
                 'timestamp': data.index[i],
-                'atr_value_at_signal': data['atr_value'].iloc[i], # Store this for reference
+                'atr_value_at_signal': data['atr_value'].iloc[i],
                 'sma_low_band_at_signal': data['sma_low_band'].iloc[i],
                 'sma_high_band_at_signal': data['sma_high_band'].iloc[i],
                 'close_at_signal': data['close'].iloc[i],
-                'details': {} # For any extra info like indicator values
+                'htf_ema_at_signal': data['htf_ema'].iloc[i] if 'htf_ema' in data.columns else np.nan,
+                'mtfa_confirmed': mtfa_confirmed_signal, # Store MTFA status
+                'details': {}
             }
 
             if signal_up.iloc[i]:
                 entry_price = data['close'].iloc[i]
-                # Stop loss is sma_low_band at signal bar for BUY
                 sl_price = data['sma_low_band'].iloc[i]
-
-                # Targets are based on ATR multiples from entry_price
-                # Pine: atr_multiplier * (4 + target), atr_multiplier * (8 + target * 2), ...
-                # Here, atr_value already includes the 0.8 multiplier.
-                # So, target_len1 = (current_atr_value / 0.8) * (4 + target_offset) * 0.8 = current_atr_value * (4 + target_offset)
-                # This interpretation matches the PineScript intent of using the scaled ATR for target steps.
-                current_atr = data['atr_value'].iloc[i] # This is already ATR * 0.8
+                current_atr = data['atr_value'].iloc[i]
 
                 tp1 = entry_price + current_atr * (4 + target_offset)
                 tp2 = entry_price + current_atr * (8 + target_offset * 2)
@@ -229,16 +245,13 @@ class NovaStrategy(BaseStrategy):
                 signals_list.append({
                     **signal_details,
                     'signal_type': 'BUY',
-                    'entry_price': entry_price,
-                    'sl_price': sl_price,
+                    'entry_price': entry_price, 'sl_price': sl_price,
                     'tp1': tp1, 'tp2': tp2, 'tp3': tp3,
                 })
 
             elif signal_down.iloc[i]:
                 entry_price = data['close'].iloc[i]
-                # Stop loss is sma_high_band at signal bar for SELL
                 sl_price = data['sma_high_band'].iloc[i]
-
                 current_atr = data['atr_value'].iloc[i]
 
                 tp1 = entry_price - current_atr * (4 + target_offset)
@@ -248,28 +261,46 @@ class NovaStrategy(BaseStrategy):
                 signals_list.append({
                     **signal_details,
                     'signal_type': 'SELL',
-                    'entry_price': entry_price,
-                    'sl_price': sl_price,
+                    'entry_price': entry_price, 'sl_price': sl_price,
                     'tp1': tp1, 'tp2': tp2, 'tp3': tp3,
                 })
 
-        # Store calculated data for potential plotting or debugging by UI (optional)
-        self.debug_data = data # Store the dataframe with all calculations
+        # Store calculated data for potential plotting or debugging by UI
+        # Ensure this debug_data includes the higher timeframe EMA if it was calculated and aligned
+        if df_higher_tf is not None and 'htf_ema' in data.columns:
+            self.debug_data = data[['close', 'sma_high_band', 'sma_low_band', 'trend_up', 'htf_ema']].copy()
+        else:
+            self.debug_data = data[['close', 'sma_high_band', 'sma_low_band', 'trend_up']].copy()
+
 
         return signals_list
 
-    def get_plotting_data(self, df_ohlc: pd.DataFrame):
+    def get_plotting_data(self, df_ohlc: pd.DataFrame, df_higher_tf_ohlc: pd.DataFrame = None):
         """
-        Helper function to get data necessary for plotting the strategy indicators.
-        Returns a DataFrame with OHLC, Heikin Ashi, bands, and trend.
+        Helper function to get data necessary for plotting the strategy indicators,
+        including higher timeframe EMA if provided.
+        Returns a DataFrame with OHLC, Heikin Ashi, bands, trend, and htf_ema.
         """
         if df_ohlc.empty:
             return pd.DataFrame()
 
-        # 1. Calculate indicators on OHLC data
+        # 1. Calculate indicators on primary OHLC data
         data_with_indicators = self._calculate_indicators(df_ohlc.copy())
 
-        # 2. Determine trend (re-run trend logic from generate_signals for consistency)
+        # 2. Calculate and align higher timeframe EMA if df_higher_tf_ohlc is provided
+        if df_higher_tf_ohlc is not None and not df_higher_tf_ohlc.empty:
+            htf_ema_length = self.params.get('mtfa_ema_length', 20)
+            htf_ema = df_higher_tf_ohlc.ta.ema(close=df_higher_tf_ohlc['close'], length=htf_ema_length)
+
+            # Align htf_ema to primary dataframe's index
+            # Reindex and forward-fill
+            aligned_htf_ema = htf_ema.reindex(data_with_indicators.index, method='ffill')
+            data_with_indicators['htf_ema'] = aligned_htf_ema
+        else:
+            data_with_indicators['htf_ema'] = np.nan
+
+
+        # 3. Determine trend (re-run trend logic from generate_signals for consistency)
         data_with_indicators['trend_up'] = False # True if current trend is up
         crossed_above_high_band = (data_with_indicators['close'] > data_with_indicators['sma_high_band']) & \
                                   (data_with_indicators['close'].shift(1) <= data_with_indicators['sma_high_band'].shift(1))

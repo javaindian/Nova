@@ -77,6 +77,7 @@ def main():
         'atr_period': {'value': 50, 'type': 'INT', 'description': 'Period for ATR calculation (PineScript: ta.atr(50))'},
         'atr_sma_period': {'value': 50, 'type': 'INT', 'description': 'Period for SMA of ATR (PineScript: ta.sma(atr, 50))'},
         'atr_multiplier': {'value': 0.8, 'type': 'FLOAT', 'description': 'Multiplier for ATR value in bands (PineScript: * 0.8)'},
+        'mtfa_ema_length': {'value': 20, 'type': 'INT', 'description': 'EMA length for Higher Timeframe confirmation (e.g., 20 on 1H chart)'},
         'primary_timeframe': {'value': '15m', 'type': 'STRING', 'description': 'Default primary timeframe for the strategy'},
         'secondary_timeframes': {'value': ['1h', '4h'], 'type': 'JSON', 'description': 'Default secondary timeframes for confirmation'}
     }
